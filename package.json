@@ -1,0 +1,10 @@
+{
+  "name": "crdt-whiteboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "多标签页协同白板：Canvas + BroadcastChannel + CRDT + Web Worker + IndexedDB",
+  "scripts": {
+    "test": "node test/crdt.test.mjs && node test/worker.test.mjs",
+    "start": "python3 -m http.server 8080"
+  }
+}

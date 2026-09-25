@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>e2e</title></head>
+<body>
+<canvas id="board" style="width:800px;height:600px"></canvas>
+<canvas id="replay"></canvas>
+<script src="../js/crdt.js"></script>
+<script src="../js/renderer.js"></script>
+<script>
+const results = [];
+function check(name, cond) {
+  results.push({ name, cond });
+  console.log((cond ? 'PASS' : 'FAIL') + ' ' + name);
+}
+
+(async () => {
+  // ---- Worker + IndexedDB + 压缩快照 ----
+  const worker = new Worker('../js/worker.js');
+  const send = (msg) => worker.postMessage(msg);
+  const once = (type) => new Promise((res) => {
+    const h = (e) => { if (e.data.type === type) { worker.removeEventListener('message', h); res(e.data); } };
+    worker.addEventListener('message', h);
+  });
+
+  send({ type: 'clear' });
+  await once('cleared');
+  send({ type: 'init' });
+  const boot0 = await once('bootstrap');
+  check('清空后 bootstrap 为空', boot0.totalOps === 0 && boot0.tail.length === 0);
+
+  // 写入 1200 条 op（触发自动快照，SNAPSHOT_EVERY=500）
+  const crdt = new StrokeCRDT('e2e');
+  const ops = [];
+  for (let i = 0; i < 1200; i++) {
+    ops.push(crdt.addStroke({ layer: 0, color: '#000', size: 2, points: [i, i, i + 2, i + 2] }));
+  }
+  ops.push(crdt.undo());
+  send({ type: 'ops', ops });
+  send({ type: 'flush' });
+  await once('flushed');
+  send({ type: 'snapshot' });
+  const snap = await once('snapshot');
+  check('快照生成', !!snap.id && snap.index === 1201);
+
+  // 模拟重启：新 worker 从 IndexedDB 恢复
+  worker.terminate();
+  const worker2 = new Worker('../js/worker.js');
+  const send2 = (msg) => worker2.postMessage(msg);
+  const once2 = (type) => new Promise((res) => {
+    const h = (e) => { if (e.data.type === type) { worker2.removeEventListener('message', h); res(e.data); } };
+    worker2.addEventListener('message', h);
+  });
+  send2({ type: 'init' });
+  const boot = await once2('bootstrap');
+  check('离线恢复：totalOps 正确', boot.totalOps === 1201);
+  check('离线恢复：快照基座非空', boot.base.strokes.length > 0);
+  // 折叠 base + tail 应等于 live 可见集（1199 可见，撤了 1 笔）
+  const visible = new Map(boot.base.strokes.map((s) => [s.id, s]));
+  for (const op of boot.tail) {
+    if (op.kind === 'stroke') visible.set(op.id, op);
+    else if (op.undone) visible.delete(op.id);
+  }
+  check('离线恢复：合并后可见 1199 笔', visible.size === 1199);
+
+  // 回放到任意历史点（走 IndexedDB 快照路径）
+  send2({ type: 'replay', targetIndex: 500 });
+  const rp = await once2('replayData');
+  const rvis = new Map(rp.base.strokes.map((s) => [s.id, s]));
+  for (const op of rp.tail) {
+    if (op.kind === 'stroke') rvis.set(op.id, op);
+    else if (op.undone) rvis.delete(op.id);
+  }
+  check('回放 @500 笔迹数正确', rvis.size === 500);
+  // 重复请求结果一致（回放不重复应用）
+  send2({ type: 'replay', targetIndex: 500 });
+  const rp2 = await once2('replayData');
+  check('回放幂等', JSON.stringify(rp2.tail) === JSON.stringify(rp.tail));
+
+  // ---- Renderer 冒烟 ----
+  const renderer = new Renderer(document.getElementById('board'));
+  for (let i = 0; i < 1000; i++) {
+    renderer.commitStroke({ layer: i % 3, color: '#123456', size: 3, tool: 'pen', points: [i % 800, i % 600, (i % 800) + 5, (i % 600) + 5] });
+  }
+  renderer.render();
+  check('渲染器 1000 笔增量提交不崩', true);
+  const t0 = performance.now();
+  renderer.redrawAll(crdt.visibleStrokes());
+  renderer.render();
+  const redrawMs = performance.now() - t0;
+  check('全量重绘 1199 笔 < 100ms (' + redrawMs.toFixed(1) + 'ms)', redrawMs < 100);
+  check('导出 PNG', renderer.exportPNG().startsWith('data:image/png'));
+
+  const failed = results.filter((r) => !r.cond).length;
+  console.log(failed === 0 ? 'E2E_ALL_PASS' : 'E2E_FAILED_' + failed);
+  document.title = failed === 0 ? 'E2E_ALL_PASS' : 'E2E_FAILED';
+})().catch((e) => {
+  console.log('E2E_ERROR ' + (e && e.stack || e));
+  document.title = 'E2E_ERROR';
+});
+</script>
+</body>
+</html>
